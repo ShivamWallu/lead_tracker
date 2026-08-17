@@ -453,7 +453,9 @@ def get_leads():
         cur.execute(query, params)
         rows = cur.fetchall()
     leads = [enrich_lead(row) for row in rows]
-    return jsonify({"success": True, "data": leads})
+    response = jsonify({"success": True, "data": leads})
+    response.headers["Cache-Control"] = "private, no-cache, stale-while-revalidate=60"
+    return response
 
 
 @app.route("/api/leads/<int:lead_id>", methods=["GET"])
@@ -593,7 +595,7 @@ def get_stats():
             "Cold": row["count_cold"] or 0,
         }
 
-    return jsonify({
+    response = jsonify({
         "success": True,
         "data": {
             "total_leads": total,
@@ -603,6 +605,8 @@ def get_stats():
             "priority_counts": priority_counts,
         }
     })
+    response.headers["Cache-Control"] = "private, no-cache, stale-while-revalidate=60"
+    return response
 
 
 # ========== Import / Export helpers ==========

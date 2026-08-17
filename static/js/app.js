@@ -1,6 +1,7 @@
 /**
  * Lead Tracker — Frontend Application
- * Ultra-fast client-side caching, instant filtering, and responsive state management.
+ * Ultra-fast Stale-While-Revalidate (SWR) client caching, instant in-memory filtering,
+ * smooth skeleton placeholders, and reactive state management.
  */
 
 (function () {
@@ -10,6 +11,9 @@
     leads: "/api/leads",
     stats: "/api/stats",
   };
+
+  const CACHE_KEY_LEADS = "lt_leads_cache_v2";
+  const CACHE_KEY_STATS = "lt_stats_cache_v2";
 
   // Master State & In-Memory Cache
   let masterLeads = [];
@@ -21,6 +25,7 @@
   let editingId = null;
   let deletingId = null;
   let viewingId = null;
+  let hasRenderedRealData = false;
 
   // Helpers
   function $(sel, root) {
@@ -28,6 +33,21 @@
   }
   function $$(sel, root) {
     return Array.from((root || document).querySelectorAll(sel));
+  }
+
+  function saveCache(key, data) {
+    try {
+      localStorage.setItem(key, JSON.stringify(data));
+    } catch (e) {}
+  }
+
+  function loadCache(key) {
+    try {
+      var raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   function formatCurrency(value) {
@@ -110,7 +130,6 @@
     if (!overlay) return;
     overlay.removeAttribute("hidden");
     overlay.classList.add("open");
-    // force reflow then fade in
     void overlay.offsetWidth;
     overlay.classList.add("visible");
     document.body.style.overflow = "hidden";
@@ -224,7 +243,6 @@
       }
 
       // Default: "attention" (Needs Attention)
-      // a) Overdue leads first
       var isOverdueA = a.is_overdue || (
         a.next_follow_up &&
         a.next_follow_up < todayStr &&
@@ -241,7 +259,6 @@
       if (isOverdueA && !isOverdueB) return -1;
       if (!isOverdueA && isOverdueB) return 1;
 
-      // b) Leads with follow-up scheduled come before leads with no follow-up
       if (a.next_follow_up && !b.next_follow_up) return -1;
       if (!a.next_follow_up && b.next_follow_up) return 1;
       if (a.next_follow_up && b.next_follow_up) {
@@ -249,7 +266,6 @@
         if (cmp !== 0) return cmp;
       }
 
-      // c) Newest created as fallback
       return (b.created_at || "").localeCompare(a.created_at || "") || (b.id - a.id);
     });
 
@@ -284,26 +300,35 @@
       }
     });
 
-    // Update Dashboard Stats cards
+    applyStatsToDOM({
+      total_leads: total,
+      overdue_followups: overdue,
+      pipeline_value: pipeline,
+      status_counts: statusCounts,
+    });
+  }
+
+  function applyStatsToDOM(d) {
+    if (!d) return;
     var el;
     el = $("#statTotal");
-    if (el) el.textContent = total;
+    if (el) el.textContent = d.total_leads != null ? d.total_leads : "—";
     el = $("#statOverdue");
-    if (el) el.textContent = overdue;
+    if (el) el.textContent = d.overdue_followups != null ? d.overdue_followups : "—";
     el = $("#statPipeline");
-    if (el) el.textContent = formatCurrency(pipeline);
+    if (el) el.textContent = d.pipeline_value != null ? formatCurrency(d.pipeline_value) : "—";
 
-    // Update Filter Tab Badge Counts
+    var sc = d.status_counts || {};
     el = $("#countAll");
-    if (el) el.textContent = total;
+    if (el) el.textContent = d.total_leads || 0;
     el = $("#countNew");
-    if (el) el.textContent = statusCounts.New || 0;
+    if (el) el.textContent = sc.New || 0;
     el = $("#countContacted");
-    if (el) el.textContent = statusCounts.Contacted || 0;
+    if (el) el.textContent = sc.Contacted || 0;
     el = $("#countConverted");
-    if (el) el.textContent = statusCounts.Converted || 0;
+    if (el) el.textContent = sc.Converted || 0;
     el = $("#countLost");
-    if (el) el.textContent = statusCounts.Lost || 0;
+    if (el) el.textContent = sc.Lost || 0;
   }
 
   // Instant view render
@@ -313,7 +338,28 @@
     renderLeads(filtered);
   }
 
-  // Master leads fetch with request deduplication
+  // Skeleton UI for cold loads
+  function renderSkeletons() {
+    var container = $("#leadsContainer");
+    if (!container || hasRenderedRealData) return;
+    var html = "";
+    for (var i = 0; i < 6; i++) {
+      html +=
+        '<div class="skeleton-row" aria-hidden="true">' +
+        '<div class="col-name"><div class="skeleton-bar w-80" style="margin-bottom:6px"></div><div class="skeleton-bar w-45"></div></div>' +
+        '<div class="col-source"><div class="skeleton-bar w-60"></div></div>' +
+        '<div class="col-value"><div class="skeleton-bar w-45"></div></div>' +
+        '<div class="col-priority"><div class="skeleton-pill"></div></div>' +
+        '<div class="col-status"><div class="skeleton-pill"></div></div>' +
+        '<div class="col-contact"><div class="skeleton-bar w-60"></div></div>' +
+        '<div class="col-followup"><div class="skeleton-bar w-60"></div></div>' +
+        '<div class="col-actions"><div class="skeleton-bar w-30"></div></div>' +
+        "</div>";
+    }
+    container.innerHTML = html;
+  }
+
+  // Master leads fetch with request deduplication and localStorage caching
   async function fetchMasterLeads(force) {
     if (inFlightFetch && !force) {
       return inFlightFetch;
@@ -323,13 +369,17 @@
       try {
         var res = await api(API.leads);
         masterLeads = res.data || [];
+        hasRenderedRealData = true;
+        saveCache(CACHE_KEY_LEADS, masterLeads);
         updateDynamicStatsAndBadges();
         renderCurrentView();
         return masterLeads;
       } catch (e) {
         console.error("Leads fetch error:", e);
-        showToast("Failed to load leads", "error");
-        renderLeads([]);
+        if (!masterLeads.length) {
+          showToast("Failed to load leads", "error");
+          renderLeads([]);
+        }
         throw e;
       } finally {
         inFlightFetch = null;
@@ -344,34 +394,34 @@
       var res = await api(API.stats);
       var d = res.data;
       if (!d) return;
-
-      var el;
-      el = $("#statTotal");
-      if (el) el.textContent = d.total_leads;
-      el = $("#statOverdue");
-      if (el) el.textContent = d.overdue_followups;
-      el = $("#statPipeline");
-      if (el) el.textContent = formatCurrency(d.pipeline_value);
-
-      var sc = d.status_counts || {};
-      el = $("#countAll");
-      if (el) el.textContent = d.total_leads;
-      el = $("#countNew");
-      if (el) el.textContent = sc.New || 0;
-      el = $("#countContacted");
-      if (el) el.textContent = sc.Contacted || 0;
-      el = $("#countConverted");
-      if (el) el.textContent = sc.Converted || 0;
-      el = $("#countLost");
-      if (el) el.textContent = sc.Lost || 0;
+      saveCache(CACHE_KEY_STATS, d);
+      applyStatsToDOM(d);
     } catch (e) {
-      // If server stats fail, fallback is already computed dynamically
       console.warn("Stats API background sync note:", e);
     }
   }
 
   async function refreshAll() {
     await Promise.all([fetchMasterLeads(true), loadStats()]);
+  }
+
+  // Hydrate instantly from cache (0ms first view)
+  function hydrateFromCache() {
+    var cachedLeads = loadCache(CACHE_KEY_LEADS);
+    var cachedStats = loadCache(CACHE_KEY_STATS);
+
+    if (cachedLeads && Array.isArray(cachedLeads) && cachedLeads.length > 0) {
+      masterLeads = cachedLeads;
+      hasRenderedRealData = true;
+      updateDynamicStatsAndBadges();
+      renderCurrentView();
+    } else {
+      renderSkeletons();
+    }
+
+    if (cachedStats) {
+      applyStatsToDOM(cachedStats);
+    }
   }
 
   // Render Leads Table
@@ -604,6 +654,7 @@
         }
         showToast("Lead added successfully");
       }
+      saveCache(CACHE_KEY_LEADS, masterLeads);
       closeModal($("#leadModal"));
       updateDynamicStatsAndBadges();
       renderCurrentView();
@@ -726,6 +777,7 @@
     try {
       await api(API.leads + "/" + deletingId, { method: "DELETE" });
       masterLeads = masterLeads.filter(function (l) { return l.id !== deletingId; });
+      saveCache(CACHE_KEY_LEADS, masterLeads);
       showToast("Lead deleted");
       closeModal($("#deleteModal"));
       deletingId = null;
@@ -1210,11 +1262,13 @@
     setTimeout(function () { report.hidden = true; }, 500);
   }
 
-  // Boot
+  // Boot — Instant Cache Hydration + Background SWR
   function boot() {
     initTheme();
     initEvents();
-    refreshAll();
+    hydrateFromCache();
+    fetchMasterLeads();
+    loadStats();
   }
 
   if (document.readyState === "loading") {
