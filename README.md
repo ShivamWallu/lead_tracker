@@ -175,3 +175,24 @@ Deal values are stored as numbers and displayed in Indian format:
 ## License
 
 MIT — feel free to use and modify for your projects.
+
+
+
+
+
+
+
+
+
+
+# Optional: custom database path (defaults to leads.db in project root)
+# DATABASE_PATH=/tmp/leads.db
+
+# For production on Vercel with a hosted Postgres (recommended for persistence):
+# DATABASE_URL=postgresql://user:password@host:5432/dbname
+
+# Flask
+# FLASK_ENV=production
+# PORT=5000
+
+

@@ -15,9 +15,26 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-app = Flask(__name__, static_folder="../static", template_folder="../templates")
+# app = Flask(__name__, static_folder="../static", template_folder="../templates")
+# CORS(app)
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_BASE_DIR)
+_STATIC_DIR = os.path.join(_ROOT_DIR, "static")
+_TEMPLATE_DIR = os.path.join(_ROOT_DIR, "templates")
+
+app = Flask(
+    __name__,
+    static_folder=_STATIC_DIR,
+    static_url_path="/static",
+    template_folder=_TEMPLATE_DIR,
+)
 CORS(app)
 
+if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    os.environ.setdefault("DATABASE_PATH", "/tmp/leads.db")
+
+    
 # Upload limits
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 MAX_IMPORT_ROWS = 2000
