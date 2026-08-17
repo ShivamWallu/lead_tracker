@@ -81,6 +81,25 @@ DATABASE_URL = (
 )
 
 if not DATABASE_URL:
+    env_file = os.path.join(_ROOT_DIR, ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    os.environ[k] = v
+        DATABASE_URL = (
+            os.environ.get("lead_DATABASE_URL")
+            or os.environ.get("lead_POSTGRES_URL")
+            or os.environ.get("POSTGRES_URL")
+            or os.environ.get("DATABASE_URL")
+        )
+
+if not DATABASE_URL:
     raise RuntimeError(
         "No Postgres connection string found. Set the 'lead_DATABASE_URL' "
         "environment variable in Vercel (Project -> Settings -> Environment "
@@ -107,8 +126,14 @@ def close_connection(exception):
         db.close()
 
 
-def init_db():
-    """Create tables and seed demo data if empty. Safe to call on every request."""
+_db_initialized = False
+
+
+def init_db(force=False):
+    """Create tables, indexes, and seed demo data if empty. Safe and memoized per process."""
+    global _db_initialized
+    if _db_initialized and not force:
+        return
     db = get_db()
     with db.cursor() as cur:
         cur.execute("""
@@ -125,7 +150,11 @@ def init_db():
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )
+            );
+            CREATE INDEX IF NOT EXISTS idx_leads_status ON leads (status);
+            CREATE INDEX IF NOT EXISTS idx_leads_priority ON leads (priority);
+            CREATE INDEX IF NOT EXISTS idx_leads_next_follow_up ON leads (next_follow_up);
+            CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads (created_at);
         """)
         db.commit()
 
@@ -217,6 +246,7 @@ def init_db():
                 demo_leads,
             )
             db.commit()
+    _db_initialized = True
 
 
 def row_to_dict(row):
@@ -527,38 +557,41 @@ def get_stats():
     init_db()
     db = get_db()
     with db.cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS c FROM leads")
-        total = cur.fetchone()["c"]
-
         cur.execute(
             """
-            SELECT COUNT(*) AS c FROM leads
-            WHERE next_follow_up IS NOT NULL
-              AND next_follow_up < CURRENT_DATE
-              AND status NOT IN ('Converted', 'Lost')
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (
+                    WHERE next_follow_up IS NOT NULL
+                      AND next_follow_up < CURRENT_DATE
+                      AND status NOT IN ('Converted', 'Lost')
+                ) AS overdue,
+                COALESCE(SUM(deal_value) FILTER (WHERE status != 'Lost'), 0) AS pipeline,
+                COUNT(*) FILTER (WHERE status = 'New') AS count_new,
+                COUNT(*) FILTER (WHERE status = 'Contacted') AS count_contacted,
+                COUNT(*) FILTER (WHERE status = 'Converted') AS count_converted,
+                COUNT(*) FILTER (WHERE status = 'Lost') AS count_lost,
+                COUNT(*) FILTER (WHERE priority = 'Hot') AS count_hot,
+                COUNT(*) FILTER (WHERE priority = 'Warm') AS count_warm,
+                COUNT(*) FILTER (WHERE priority = 'Cold') AS count_cold
+            FROM leads
             """
         )
-        overdue = cur.fetchone()["c"]
-
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(deal_value), 0) AS total FROM leads
-            WHERE status != 'Lost'
-            """
-        )
-        pipeline = float(cur.fetchone()["total"])
-
-        cur.execute("SELECT status, COUNT(*) AS c FROM leads GROUP BY status")
-        status_rows = cur.fetchall()
-        status_counts = {r["status"]: r["c"] for r in status_rows}
-        for s in ("New", "Contacted", "Converted", "Lost"):
-            status_counts.setdefault(s, 0)
-
-        cur.execute("SELECT priority, COUNT(*) AS c FROM leads GROUP BY priority")
-        priority_rows = cur.fetchall()
-        priority_counts = {r["priority"]: r["c"] for r in priority_rows}
-        for p in ("Hot", "Warm", "Cold"):
-            priority_counts.setdefault(p, 0)
+        row = cur.fetchone()
+        total = row["total"] or 0
+        overdue = row["overdue"] or 0
+        pipeline = float(row["pipeline"] or 0)
+        status_counts = {
+            "New": row["count_new"] or 0,
+            "Contacted": row["count_contacted"] or 0,
+            "Converted": row["count_converted"] or 0,
+            "Lost": row["count_lost"] or 0,
+        }
+        priority_counts = {
+            "Hot": row["count_hot"] or 0,
+            "Warm": row["count_warm"] or 0,
+            "Cold": row["count_cold"] or 0,
+        }
 
     return jsonify({
         "success": True,
