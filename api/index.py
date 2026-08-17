@@ -2,7 +2,6 @@ import os
 import io
 import csv
 import re
-import sqlite3
 from datetime import datetime, date
 from flask import Flask, request, jsonify, render_template, g, Response
 from flask_cors import CORS
@@ -15,8 +14,12 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-# app = Flask(__name__, static_folder="../static", template_folder="../templates")
-# CORS(app)
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_BASE_DIR)
@@ -31,10 +34,6 @@ app = Flask(
 )
 CORS(app)
 
-if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
-    os.environ.setdefault("DATABASE_PATH", "/tmp/leads.db")
-
-    
 # Upload limits
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 MAX_IMPORT_ROWS = 2000
@@ -66,16 +65,38 @@ COLUMN_ALIASES = {
     "notes": ["notes", "note", "comments", "remark", "remarks", "description"],
 }
 
-# Database path - works for local and can be overridden
-DATABASE = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "..", "leads.db"))
+# ---------------------------------------------------------------------------
+# DATABASE CONNECTION (Neon / Postgres)
+#
+# Your Vercel Neon integration was created with the prefix "lead_", so the
+# variables it injected are named lead_DATABASE_URL, lead_PGHOST, etc.
+# (not plain DATABASE_URL). We check several likely names so this works
+# whether you keep the "lead_" prefix or rename them later.
+# ---------------------------------------------------------------------------
+DATABASE_URL = (
+    os.environ.get("lead_DATABASE_URL")
+    or os.environ.get("lead_POSTGRES_URL")
+    or os.environ.get("POSTGRES_URL")
+    or os.environ.get("DATABASE_URL")
+)
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "No Postgres connection string found. Set the 'lead_DATABASE_URL' "
+        "environment variable in Vercel (Project -> Settings -> Environment "
+        "Variables) to your Neon connection string."
+    )
 
 
 def get_db():
     db = getattr(g, "_database", None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys = ON")
+        if not PSYCOPG2_AVAILABLE:
+            raise RuntimeError("psycopg2-binary is not installed. Add it to requirements.txt")
+        db = g._database = psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+        )
     return db
 
 
@@ -87,185 +108,125 @@ def close_connection(exception):
 
 
 def init_db():
-    """Create tables and seed demo data if empty."""
+    """Create tables and seed demo data if empty. Safe to call on every request."""
     db = get_db()
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            contact_number TEXT NOT NULL,
-            source TEXT NOT NULL,
-            deal_value REAL NOT NULL DEFAULT 0,
-            priority TEXT NOT NULL CHECK(priority IN ('Hot', 'Warm', 'Cold')),
-            status TEXT NOT NULL CHECK(status IN ('New', 'Contacted', 'Converted', 'Lost')),
-            last_contact_date TEXT,
-            next_follow_up TEXT,
-            notes TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    db.commit()
-
-    # Seed demo data only if table is empty
-    count = db.execute("SELECT COUNT(*) as c FROM leads").fetchone()["c"]
-    if count == 0:
-        now = datetime.utcnow().isoformat() + "Z"
-        today = date.today()
-        demo_leads = [
-            (
-                "Sigma Electric",
-                "+91 98200 11223",
-                "Referral",
-                850000,
-                "Hot",
-                "Contacted",
-                (today.replace(day=max(1, today.day - 2))).isoformat(),
-                (today.replace(day=max(1, today.day - 4))).isoformat(),  # overdue
-                "Called customer on Monday. Interested in enterprise package. Requested pricing proposal. Follow up ASAP.",
-                now,
-                now,
-            ),
-            (
-                "B-Infra Hyderabad",
-                "+91 90000 44556",
-                "Outbound",
-                400000,
-                "Warm",
-                "New",
-                None,
-                (today.replace(day=min(28, today.day + 2))).isoformat(),
-                "Initial outreach via LinkedIn. Decision maker is the Project Director.",
-                now,
-                now,
-            ),
-            (
-                "Aether Tech Solutions",
-                "+91 98765 43210",
-                "Website",
-                1250000,
-                "Hot",
-                "Contacted",
-                (today.replace(day=max(1, today.day - 1))).isoformat(),
-                (today.replace(day=min(28, today.day + 1))).isoformat(),
-                "Demo completed. Waiting for internal budget approval. High intent.",
-                now,
-                now,
-            ),
-            (
-                "Nova Retail Pvt Ltd",
-                "+91 91234 56789",
-                "Social Media",
-                275000,
-                "Cold",
-                "New",
-                None,
-                (today.replace(day=min(28, today.day + 5))).isoformat(),
-                "Inbound inquiry from Instagram ad. Needs more nurturing.",
-                now,
-                now,
-            ),
-            (
-                "Horizon Logistics",
-                "+91 99887 76655",
-                "Existing Customer",
-                620000,
-                "Warm",
-                "Contacted",
-                (today.replace(day=max(1, today.day - 5))).isoformat(),
-                (today.replace(day=max(1, today.day - 1))).isoformat(),  # overdue
-                "Upsell opportunity for warehouse management module. Spoke with ops head.",
-                now,
-                now,
-            ),
-            (
-                "Pixel Design Studio",
-                "+91 97654 32109",
-                "Referral",
-                180000,
-                "Warm",
-                "Converted",
-                (today.replace(day=max(1, today.day - 10))).isoformat(),
-                None,
-                "Deal closed. Implementation starts next month. Happy customer.",
-                now,
-                now,
-            ),
-            (
-                "GreenField Agro",
-                "+91 96543 21098",
-                "Advertisement",
-                950000,
-                "Hot",
-                "New",
-                None,
-                (today.replace(day=min(28, today.day + 3))).isoformat(),
-                "Responded to Google Ads campaign. Looking for ERP for 3 locations.",
-                now,
-                now,
-            ),
-            (
-                "Metro Construction Co",
-                "+91 95432 10987",
-                "Outbound",
-                2100000,
-                "Hot",
-                "Contacted",
-                (today.replace(day=max(1, today.day - 3))).isoformat(),
-                (today.replace(day=max(1, today.day - 2))).isoformat(),  # overdue
-                "Multiple stakeholders. Need to send revised proposal with volume discount.",
-                now,
-                now,
-            ),
-            (
-                "Lumina Healthcare",
-                "+91 94321 09876",
-                "Website",
-                540000,
-                "Warm",
-                "Lost",
-                (today.replace(day=max(1, today.day - 20))).isoformat(),
-                None,
-                "Chose competitor due to tighter timeline. Keep warm for future.",
-                now,
-                now,
-            ),
-            (
-                "SwiftPay Fintech",
-                "+91 93210 98765",
-                "Other",
-                780000,
-                "Cold",
-                "New",
-                None,
-                (today.replace(day=min(28, today.day + 7))).isoformat(),
-                "Came through industry event. Early stage discussion.",
-                now,
-                now,
-            ),
-        ]
-        db.executemany(
-            """
-            INSERT INTO leads (
-                name, contact_number, source, deal_value, priority, status,
-                last_contact_date, next_follow_up, notes, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            demo_leads,
-        )
+    with db.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                contact_number TEXT NOT NULL,
+                source TEXT NOT NULL,
+                deal_value NUMERIC NOT NULL DEFAULT 0,
+                priority TEXT NOT NULL CHECK (priority IN ('Hot', 'Warm', 'Cold')),
+                status TEXT NOT NULL CHECK (status IN ('New', 'Contacted', 'Converted', 'Lost')),
+                last_contact_date DATE,
+                next_follow_up DATE,
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         db.commit()
+
+        cur.execute("SELECT COUNT(*) AS c FROM leads")
+        count = cur.fetchone()["c"]
+
+        if count == 0:
+            now = datetime.utcnow().isoformat() + "Z"
+            today = date.today()
+            demo_leads = [
+                (
+                    "Sigma Electric", "+91 98200 11223", "Referral", 850000, "Hot", "Contacted",
+                    (today.replace(day=max(1, today.day - 2))).isoformat(),
+                    (today.replace(day=max(1, today.day - 4))).isoformat(),
+                    "Called customer on Monday. Interested in enterprise package. Requested pricing proposal. Follow up ASAP.",
+                    now, now,
+                ),
+                (
+                    "B-Infra Hyderabad", "+91 90000 44556", "Outbound", 400000, "Warm", "New",
+                    None,
+                    (today.replace(day=min(28, today.day + 2))).isoformat(),
+                    "Initial outreach via LinkedIn. Decision maker is the Project Director.",
+                    now, now,
+                ),
+                (
+                    "Aether Tech Solutions", "+91 98765 43210", "Website", 1250000, "Hot", "Contacted",
+                    (today.replace(day=max(1, today.day - 1))).isoformat(),
+                    (today.replace(day=min(28, today.day + 1))).isoformat(),
+                    "Demo completed. Waiting for internal budget approval. High intent.",
+                    now, now,
+                ),
+                (
+                    "Nova Retail Pvt Ltd", "+91 91234 56789", "Social Media", 275000, "Cold", "New",
+                    None,
+                    (today.replace(day=min(28, today.day + 5))).isoformat(),
+                    "Inbound inquiry from Instagram ad. Needs more nurturing.",
+                    now, now,
+                ),
+                (
+                    "Horizon Logistics", "+91 99887 76655", "Existing Customer", 620000, "Warm", "Contacted",
+                    (today.replace(day=max(1, today.day - 5))).isoformat(),
+                    (today.replace(day=max(1, today.day - 1))).isoformat(),
+                    "Upsell opportunity for warehouse management module. Spoke with ops head.",
+                    now, now,
+                ),
+                (
+                    "Pixel Design Studio", "+91 97654 32109", "Referral", 180000, "Warm", "Converted",
+                    (today.replace(day=max(1, today.day - 10))).isoformat(),
+                    None,
+                    "Deal closed. Implementation starts next month. Happy customer.",
+                    now, now,
+                ),
+                (
+                    "GreenField Agro", "+91 96543 21098", "Advertisement", 950000, "Hot", "New",
+                    None,
+                    (today.replace(day=min(28, today.day + 3))).isoformat(),
+                    "Responded to Google Ads campaign. Looking for ERP for 3 locations.",
+                    now, now,
+                ),
+                (
+                    "Metro Construction Co", "+91 95432 10987", "Outbound", 2100000, "Hot", "Contacted",
+                    (today.replace(day=max(1, today.day - 3))).isoformat(),
+                    (today.replace(day=max(1, today.day - 2))).isoformat(),
+                    "Multiple stakeholders. Need to send revised proposal with volume discount.",
+                    now, now,
+                ),
+                (
+                    "Lumina Healthcare", "+91 94321 09876", "Website", 540000, "Warm", "Lost",
+                    (today.replace(day=max(1, today.day - 20))).isoformat(),
+                    None,
+                    "Chose competitor due to tighter timeline. Keep warm for future.",
+                    now, now,
+                ),
+                (
+                    "SwiftPay Fintech", "+91 93210 98765", "Other", 780000, "Cold", "New",
+                    None,
+                    (today.replace(day=min(28, today.day + 7))).isoformat(),
+                    "Came through industry event. Early stage discussion.",
+                    now, now,
+                ),
+            ]
+            cur.executemany(
+                """
+                INSERT INTO leads (
+                    name, contact_number, source, deal_value, priority, status,
+                    last_contact_date, next_follow_up, notes, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                demo_leads,
+            )
+            db.commit()
 
 
 def row_to_dict(row):
     if row is None:
         return None
-    d = dict(row)
-    return d
+    return dict(row)
 
 
 def validate_lead_data(data, is_update=False):
     errors = []
-
     name = (data.get("name") or "").strip()
     if not name:
         errors.append("Name / Company Name is required")
@@ -356,9 +317,11 @@ def compute_days_since_contact(last_contact_date):
     if not last_contact_date:
         return None
     try:
-        lcd = datetime.strptime(last_contact_date, "%Y-%m-%d").date()
-        delta = (date.today() - lcd).days
-        return delta
+        if hasattr(last_contact_date, "isoformat") and not isinstance(last_contact_date, str):
+            lcd = last_contact_date
+        else:
+            lcd = datetime.strptime(str(last_contact_date), "%Y-%m-%d").date()
+        return (date.today() - lcd).days
     except Exception:
         return None
 
@@ -369,20 +332,36 @@ def is_overdue(next_follow_up, status):
     if status in ("Converted", "Lost"):
         return False
     try:
-        nfd = datetime.strptime(next_follow_up, "%Y-%m-%d").date()
+        if hasattr(next_follow_up, "isoformat") and not isinstance(next_follow_up, str):
+            nfd = next_follow_up
+        else:
+            nfd = datetime.strptime(str(next_follow_up), "%Y-%m-%d").date()
         return nfd < date.today()
     except Exception:
         return False
 
 
+def _date_str(v):
+    """Postgres returns DATE columns as datetime.date objects; normalize to 'YYYY-MM-DD' string for the frontend."""
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
 def enrich_lead(lead):
-    """Add computed fields for the frontend."""
+    """Add computed fields for the frontend and normalize date types."""
     if lead is None:
         return None
     lead = dict(lead)
+    lead["last_contact_date"] = _date_str(lead.get("last_contact_date"))
+    lead["next_follow_up"] = _date_str(lead.get("next_follow_up"))
     days = compute_days_since_contact(lead.get("last_contact_date"))
     lead["days_since_contact"] = days
     lead["is_overdue"] = is_overdue(lead.get("next_follow_up"), lead.get("status"))
+    if lead.get("deal_value") is not None:
+        lead["deal_value"] = float(lead["deal_value"])
     return lead
 
 
@@ -395,7 +374,6 @@ def index():
 def get_leads():
     init_db()
     db = get_db()
-
     status = request.args.get("status")
     priority = request.args.get("priority")
     search = (request.args.get("search") or "").strip()
@@ -403,21 +381,17 @@ def get_leads():
 
     query = "SELECT * FROM leads WHERE 1=1"
     params = []
-
     if status and status != "All":
-        query += " AND status = ?"
+        query += " AND status = %s"
         params.append(status)
-
     if priority and priority != "All":
-        query += " AND priority = ?"
+        query += " AND priority = %s"
         params.append(priority)
-
     if search:
-        query += " AND (name LIKE ? OR contact_number LIKE ? OR source LIKE ? OR notes LIKE ?)"
+        query += " AND (name ILIKE %s OR contact_number ILIKE %s OR source ILIKE %s OR notes ILIKE %s)"
         like = f"%{search}%"
         params.extend([like, like, like, like])
 
-    # Sorting
     if sort == "newest":
         query += " ORDER BY created_at DESC"
     elif sort == "oldest":
@@ -431,12 +405,11 @@ def get_leads():
     elif sort == "priority":
         query += " ORDER BY CASE priority WHEN 'Hot' THEN 1 WHEN 'Warm' THEN 2 ELSE 3 END"
     else:
-        # Default: attention — overdue first, then soonest follow-up, then newest
         query += """
             ORDER BY
                 CASE
                     WHEN next_follow_up IS NOT NULL
-                         AND next_follow_up < date('now')
+                         AND next_follow_up < CURRENT_DATE
                          AND status NOT IN ('Converted', 'Lost')
                     THEN 0
                     ELSE 1
@@ -446,7 +419,9 @@ def get_leads():
                 created_at DESC
         """
 
-    rows = db.execute(query, params).fetchall()
+    with db.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
     leads = [enrich_lead(row) for row in rows]
     return jsonify({"success": True, "data": leads})
 
@@ -455,7 +430,9 @@ def get_leads():
 def get_lead(lead_id):
     init_db()
     db = get_db()
-    row = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    with db.cursor() as cur:
+        cur.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        row = cur.fetchone()
     if not row:
         return jsonify({"success": False, "error": "Lead not found"}), 404
     return jsonify({"success": True, "data": enrich_lead(row)})
@@ -471,30 +448,26 @@ def create_lead():
 
     now = datetime.utcnow().isoformat() + "Z"
     db = get_db()
-    cursor = db.execute(
-        """
-        INSERT INTO leads (
-            name, contact_number, source, deal_value, priority, status,
-            last_contact_date, next_follow_up, notes, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            validated["name"],
-            validated["contact_number"],
-            validated["source"],
-            validated["deal_value"],
-            validated["priority"],
-            validated["status"],
-            validated["last_contact_date"],
-            validated["next_follow_up"],
-            validated["notes"],
-            now,
-            now,
-        ),
-    )
-    db.commit()
-    lead_id = cursor.lastrowid
-    row = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO leads (
+                name, contact_number, source, deal_value, priority, status,
+                last_contact_date, next_follow_up, notes, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                validated["name"], validated["contact_number"], validated["source"],
+                validated["deal_value"], validated["priority"], validated["status"],
+                validated["last_contact_date"], validated["next_follow_up"],
+                validated["notes"], now, now,
+            ),
+        )
+        lead_id = cur.fetchone()["id"]
+        db.commit()
+        cur.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        row = cur.fetchone()
     return jsonify({"success": True, "data": enrich_lead(row)}), 201
 
 
@@ -502,40 +475,36 @@ def create_lead():
 def update_lead(lead_id):
     init_db()
     db = get_db()
-    existing = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
-    if not existing:
-        return jsonify({"success": False, "error": "Lead not found"}), 404
+    with db.cursor() as cur:
+        cur.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        existing = cur.fetchone()
+        if not existing:
+            return jsonify({"success": False, "error": "Lead not found"}), 404
 
-    data = request.get_json(silent=True) or {}
-    validated, errors = validate_lead_data(data, is_update=True)
-    if errors:
-        return jsonify({"success": False, "errors": errors}), 400
+        data = request.get_json(silent=True) or {}
+        validated, errors = validate_lead_data(data, is_update=True)
+        if errors:
+            return jsonify({"success": False, "errors": errors}), 400
 
-    now = datetime.utcnow().isoformat() + "Z"
-    db.execute(
-        """
-        UPDATE leads SET
-            name = ?, contact_number = ?, source = ?, deal_value = ?,
-            priority = ?, status = ?, last_contact_date = ?, next_follow_up = ?,
-            notes = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            validated["name"],
-            validated["contact_number"],
-            validated["source"],
-            validated["deal_value"],
-            validated["priority"],
-            validated["status"],
-            validated["last_contact_date"],
-            validated["next_follow_up"],
-            validated["notes"],
-            now,
-            lead_id,
-        ),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        now = datetime.utcnow().isoformat() + "Z"
+        cur.execute(
+            """
+            UPDATE leads SET
+                name = %s, contact_number = %s, source = %s, deal_value = %s,
+                priority = %s, status = %s, last_contact_date = %s, next_follow_up = %s,
+                notes = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (
+                validated["name"], validated["contact_number"], validated["source"],
+                validated["deal_value"], validated["priority"], validated["status"],
+                validated["last_contact_date"], validated["next_follow_up"],
+                validated["notes"], now, lead_id,
+            ),
+        )
+        db.commit()
+        cur.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        row = cur.fetchone()
     return jsonify({"success": True, "data": enrich_lead(row)})
 
 
@@ -543,11 +512,13 @@ def update_lead(lead_id):
 def delete_lead(lead_id):
     init_db()
     db = get_db()
-    existing = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
-    if not existing:
-        return jsonify({"success": False, "error": "Lead not found"}), 404
-    db.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
-    db.commit()
+    with db.cursor() as cur:
+        cur.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        existing = cur.fetchone()
+        if not existing:
+            return jsonify({"success": False, "error": "Lead not found"}), 404
+        cur.execute("DELETE FROM leads WHERE id = %s", (lead_id,))
+        db.commit()
     return jsonify({"success": True, "message": "Lead deleted"})
 
 
@@ -555,40 +526,39 @@ def delete_lead(lead_id):
 def get_stats():
     init_db()
     db = get_db()
+    with db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS c FROM leads")
+        total = cur.fetchone()["c"]
 
-    total = db.execute("SELECT COUNT(*) as c FROM leads").fetchone()["c"]
+        cur.execute(
+            """
+            SELECT COUNT(*) AS c FROM leads
+            WHERE next_follow_up IS NOT NULL
+              AND next_follow_up < CURRENT_DATE
+              AND status NOT IN ('Converted', 'Lost')
+            """
+        )
+        overdue = cur.fetchone()["c"]
 
-    overdue = db.execute(
-        """
-        SELECT COUNT(*) as c FROM leads
-        WHERE next_follow_up IS NOT NULL
-          AND next_follow_up < date('now')
-          AND status NOT IN ('Converted', 'Lost')
-        """
-    ).fetchone()["c"]
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(deal_value), 0) AS total FROM leads
+            WHERE status != 'Lost'
+            """
+        )
+        pipeline = float(cur.fetchone()["total"])
 
-    pipeline = db.execute(
-        """
-        SELECT COALESCE(SUM(deal_value), 0) as total FROM leads
-        WHERE status != 'Lost'
-        """
-    ).fetchone()["total"]
+        cur.execute("SELECT status, COUNT(*) AS c FROM leads GROUP BY status")
+        status_rows = cur.fetchall()
+        status_counts = {r["status"]: r["c"] for r in status_rows}
+        for s in ("New", "Contacted", "Converted", "Lost"):
+            status_counts.setdefault(s, 0)
 
-    # Status counts
-    status_rows = db.execute(
-        "SELECT status, COUNT(*) as c FROM leads GROUP BY status"
-    ).fetchall()
-    status_counts = {r["status"]: r["c"] for r in status_rows}
-    for s in ("New", "Contacted", "Converted", "Lost"):
-        status_counts.setdefault(s, 0)
-
-    # Priority counts
-    priority_rows = db.execute(
-        "SELECT priority, COUNT(*) as c FROM leads GROUP BY priority"
-    ).fetchall()
-    priority_counts = {r["priority"]: r["c"] for r in priority_rows}
-    for p in ("Hot", "Warm", "Cold"):
-        priority_counts.setdefault(p, 0)
+        cur.execute("SELECT priority, COUNT(*) AS c FROM leads GROUP BY priority")
+        priority_rows = cur.fetchall()
+        priority_counts = {r["priority"]: r["c"] for r in priority_rows}
+        for p in ("Hot", "Warm", "Cold"):
+            priority_counts.setdefault(p, 0)
 
     return jsonify({
         "success": True,
@@ -611,11 +581,9 @@ def _normalize_header(h):
 
 
 def auto_map_columns(headers):
-    """Map file headers to app column keys using aliases."""
-    mapping = {}  # app_key -> header index
+    mapping = {}
     used_indices = set()
     normalized = [_normalize_header(h) for h in headers]
-
     for col in APP_COLUMNS:
         key = col["key"]
         aliases = COLUMN_ALIASES.get(key, [key])
@@ -633,7 +601,6 @@ def parse_date_value(val):
     if val is None or str(val).strip() == "":
         return None
     s = str(val).strip()
-    # Excel serial date
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         try:
             from openpyxl.utils.datetime import from_excel
@@ -645,7 +612,6 @@ def parse_date_value(val):
             return datetime.strptime(s[:20], fmt).date().isoformat()
         except ValueError:
             continue
-    # ISO-ish
     try:
         return datetime.fromisoformat(s.replace("Z", "").split("T")[0]).date().isoformat()
     except Exception:
@@ -658,19 +624,16 @@ def parse_deal_value(val):
     s = str(val).strip().replace(",", "").replace("₹", "").replace("Rs.", "").replace("Rs", "")
     s = s.replace("L", "").replace("l", "").strip()
     try:
-        # If original had L, multiply? Better leave numeric as-is; user should use raw numbers
         return float(s)
     except ValueError:
         return None
 
 
 def read_uploaded_rows(file_storage):
-    """Return (headers: list[str], rows: list[list], error: str|None)"""
     filename = secure_filename(file_storage.filename or "")
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_EXTENSIONS:
         return None, None, "Only .csv, .xlsx, .xls files are allowed"
-
     raw = file_storage.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         return None, None, f"File too large. Max {MAX_UPLOAD_BYTES // (1024*1024)} MB"
@@ -695,10 +658,8 @@ def read_uploaded_rows(file_storage):
 
     if not OPENPYXL_AVAILABLE:
         return None, None, "Excel support requires openpyxl. Run: pip install openpyxl"
-
     if ext == "xls":
         return None, None, "Legacy .xls is not supported. Please save as .xlsx or .csv"
-
     try:
         wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
         ws = wb.active
@@ -718,15 +679,12 @@ def read_uploaded_rows(file_storage):
 
 
 def row_to_lead_dict(row, mapping):
-    """Build lead dict from a file row using mapping {app_key: col_index}."""
     def cell(key):
         idx = mapping.get(key)
         if idx is None or idx >= len(row):
             return None
         v = row[idx]
-        if v is None:
-            return None
-        return v
+        return None if v is None else v
 
     name = cell("name")
     contact = cell("contact_number")
@@ -749,9 +707,8 @@ def row_to_lead_dict(row, mapping):
         "next_follow_up": parse_date_value(next_f),
         "notes": str(notes).strip() if notes is not None else "",
     }
-    # Normalize enums
+
     if data["priority"] not in ("Hot", "Warm", "Cold"):
-        # try common variants
         p = data["priority"].lower()
         if p in ("high", "hot"):
             data["priority"] = "Hot"
@@ -759,6 +716,7 @@ def row_to_lead_dict(row, mapping):
             data["priority"] = "Warm"
         elif p in ("low", "cold"):
             data["priority"] = "Cold"
+
     if data["status"] not in ("New", "Contacted", "Converted", "Lost"):
         s = data["status"].lower()
         if s in ("new", "fresh"):
@@ -769,23 +727,23 @@ def row_to_lead_dict(row, mapping):
             data["status"] = "Converted"
         elif s in ("lost", "dead"):
             data["status"] = "Lost"
+
     allowed_sources = [
         "Referral", "Website", "Outbound", "Social Media",
         "Advertisement", "Existing Customer", "Other"
     ]
     if data["source"] and data["source"] not in allowed_sources:
-        # fuzzy match
         found = None
         for a in allowed_sources:
             if a.lower() == data["source"].lower():
                 found = a
                 break
         data["source"] = found or "Other"
+
     return data
 
 
 def validate_import_row(data, existing_keys):
-    """Return list of error strings. empty = valid."""
     errors = []
     if not data.get("name"):
         errors.append("Name is required")
@@ -801,7 +759,6 @@ def validate_import_row(data, existing_keys):
         errors.append("Status must be New, Contacted, Converted or Lost")
     if not data.get("source"):
         errors.append("Source is required")
-    # Duplicate detection by name+contact
     key = (data.get("name", "").lower(), data.get("contact_number", "").lower())
     if key in existing_keys:
         errors.append("Duplicate (same name + contact already exists or in file)")
@@ -821,7 +778,6 @@ def import_preview():
     if err:
         return jsonify({"success": False, "error": err}), 400
 
-    # Optional manual mapping from client: JSON string mapping app_key -> header name or index
     manual_map = None
     if request.form.get("mapping"):
         try:
@@ -831,7 +787,6 @@ def import_preview():
             manual_map = None
 
     if manual_map:
-        # manual_map: { app_key: header_name }
         header_to_idx = {_normalize_header(h): i for i, h in enumerate(headers)}
         mapping = {}
         for key, header_name in manual_map.items():
@@ -851,9 +806,10 @@ def import_preview():
     used_indices = set(mapping.values())
     extra_columns = [headers[i] for i in range(len(headers)) if i not in used_indices and headers[i]]
 
-    # Existing DB keys for duplicate check
     db = get_db()
-    existing = db.execute("SELECT name, contact_number FROM leads").fetchall()
+    with db.cursor() as cur:
+        cur.execute("SELECT name, contact_number FROM leads")
+        existing = cur.fetchall()
     existing_keys = {(r["name"].lower(), r["contact_number"].lower()) for r in existing}
 
     preview_rows = []
@@ -863,7 +819,6 @@ def import_preview():
     file_keys = set()
 
     for i, row in enumerate(data_rows):
-        # skip fully empty rows
         if all(c is None or str(c).strip() == "" for c in row):
             continue
         data = row_to_lead_dict(row, mapping)
@@ -878,14 +833,13 @@ def import_preview():
             valid_count += 1
             file_keys.add(key)
         preview_rows.append({
-            "row_number": i + 2,  # 1-based + header
+            "row_number": i + 2,
             "data": data,
             "errors": errors,
             "valid": len(errors) == 0,
         })
 
     valid_payload = [r["data"] for r in preview_rows if r["valid"]]
-
     return jsonify({
         "success": True,
         "data": {
@@ -899,7 +853,7 @@ def import_preview():
             "valid_rows": valid_count,
             "invalid_rows": invalid_count,
             "duplicate_rows": duplicate_count,
-            "preview": preview_rows[:100],  # first 100 for UI
+            "preview": preview_rows[:100],
             "valid_payload": valid_payload,
             "mapping": mapping,
         }
@@ -908,7 +862,6 @@ def import_preview():
 
 @app.route("/api/import/confirm", methods=["POST"])
 def import_confirm():
-    """Accept JSON body with list of validated lead objects to insert."""
     init_db()
     body = request.get_json(silent=True) or {}
     rows = body.get("rows") or []
@@ -918,7 +871,9 @@ def import_confirm():
         return jsonify({"success": False, "error": f"Max {MAX_IMPORT_ROWS} rows per import"}), 400
 
     db = get_db()
-    existing = db.execute("SELECT name, contact_number FROM leads").fetchall()
+    with db.cursor() as cur:
+        cur.execute("SELECT name, contact_number FROM leads")
+        existing = cur.fetchall()
     existing_keys = {(r["name"].lower(), r["contact_number"].lower()) for r in existing}
 
     inserted = 0
@@ -927,40 +882,34 @@ def import_confirm():
     now = datetime.utcnow().isoformat() + "Z"
 
     try:
-        for i, raw in enumerate(rows):
-            validated, errs = validate_lead_data(raw)
-            if errs:
-                skipped += 1
-                errors_out.append({"row": i + 1, "errors": errs})
-                continue
-            key = (validated["name"].lower(), validated["contact_number"].lower())
-            if key in existing_keys:
-                skipped += 1
-                errors_out.append({"row": i + 1, "errors": ["Duplicate"]})
-                continue
-            db.execute(
-                """
-                INSERT INTO leads (
-                    name, contact_number, source, deal_value, priority, status,
-                    last_contact_date, next_follow_up, notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    validated["name"],
-                    validated["contact_number"],
-                    validated["source"],
-                    validated["deal_value"],
-                    validated["priority"],
-                    validated["status"],
-                    validated["last_contact_date"],
-                    validated["next_follow_up"],
-                    validated["notes"],
-                    now,
-                    now,
-                ),
-            )
-            existing_keys.add(key)
-            inserted += 1
+        with db.cursor() as cur:
+            for i, raw in enumerate(rows):
+                validated, errs = validate_lead_data(raw)
+                if errs:
+                    skipped += 1
+                    errors_out.append({"row": i + 1, "errors": errs})
+                    continue
+                key = (validated["name"].lower(), validated["contact_number"].lower())
+                if key in existing_keys:
+                    skipped += 1
+                    errors_out.append({"row": i + 1, "errors": ["Duplicate"]})
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO leads (
+                        name, contact_number, source, deal_value, priority, status,
+                        last_contact_date, next_follow_up, notes, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        validated["name"], validated["contact_number"], validated["source"],
+                        validated["deal_value"], validated["priority"], validated["status"],
+                        validated["last_contact_date"], validated["next_follow_up"],
+                        validated["notes"], now, now,
+                    ),
+                )
+                existing_keys.add(key)
+                inserted += 1
         db.commit()
     except Exception as e:
         db.rollback()
@@ -983,7 +932,6 @@ def export_leads():
     if fmt not in ("csv", "xlsx"):
         return jsonify({"success": False, "error": "format must be csv or xlsx"}), 400
 
-    # Reuse same filters as list endpoint
     status = request.args.get("status")
     priority = request.args.get("priority")
     search = (request.args.get("search") or "").strip()
@@ -992,13 +940,13 @@ def export_leads():
     query = "SELECT * FROM leads WHERE 1=1"
     params = []
     if status and status != "All":
-        query += " AND status = ?"
+        query += " AND status = %s"
         params.append(status)
     if priority and priority != "All":
-        query += " AND priority = ?"
+        query += " AND priority = %s"
         params.append(priority)
     if search:
-        query += " AND (name LIKE ? OR contact_number LIKE ? OR source LIKE ? OR notes LIKE ?)"
+        query += " AND (name ILIKE %s OR contact_number ILIKE %s OR source ILIKE %s OR notes ILIKE %s)"
         like = f"%{search}%"
         params.extend([like, like, like, like])
 
@@ -1019,7 +967,7 @@ def export_leads():
             ORDER BY
                 CASE
                     WHEN next_follow_up IS NOT NULL
-                         AND next_follow_up < date('now')
+                         AND next_follow_up < CURRENT_DATE
                          AND status NOT IN ('Converted', 'Lost')
                     THEN 0 ELSE 1 END,
                 CASE WHEN next_follow_up IS NULL THEN 1 ELSE 0 END,
@@ -1027,13 +975,14 @@ def export_leads():
         """
 
     db = get_db()
-    rows = db.execute(query, params).fetchall()
+    with db.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
     leads = [enrich_lead(r) for r in rows]
 
     today = date.today().isoformat()
     filter_tag = "filtered_" if (status and status != "All") or (priority and priority != "All") or search else ""
     filename_base = f"leads_{filter_tag}{today}"
-
     export_headers = [
         "Name / Company", "Contact Number", "Source", "Deal Value",
         "Priority", "Status", "Last Contact Date", "Next Follow-up",
@@ -1072,7 +1021,6 @@ def export_leads():
             },
         )
 
-    # xlsx
     if not OPENPYXL_AVAILABLE:
         return jsonify({"success": False, "error": "openpyxl required for Excel export"}), 500
 
